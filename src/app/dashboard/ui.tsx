@@ -25,6 +25,49 @@ import {
 
 type Generated = { url?: string; b64?: string; path?: string };
 
+/* =========================
+   UI HELPERS
+========================= */
+
+function Toggle({
+  checked,
+  onChange,
+  label,
+  helper,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  helper?: string;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 p-3">
+      <div className="min-w-0">
+        <div className="text-sm font-medium text-zinc-100">{label}</div>
+        {helper ? (
+          <div className="mt-0.5 text-xs text-zinc-400">{helper}</div>
+        ) : null}
+      </div>
+      <button
+        type="button"
+        aria-pressed={checked}
+        onClick={() => onChange(!checked)}
+        className={[
+          "relative h-7 w-12 shrink-0 rounded-full border border-white/10 transition",
+          checked ? "bg-fuchsia-500/40" : "bg-white/10",
+        ].join(" ")}
+      >
+        <span
+          className={[
+            "absolute top-0.5 h-6 w-6 rounded-full bg-white shadow-soft transition",
+            checked ? "left-5" : "left-0.5",
+          ].join(" ")}
+        />
+      </button>
+    </div>
+  );
+}
+
 function dataUrlFromB64(b64: string) {
   return `data:image/png;base64,${b64}`;
 }
@@ -87,7 +130,7 @@ function isPayloadTooLargeMessage(msg: string) {
 
 /**
  * Sanitiza prompt para reduzir bloqueio por safety:
- * - remove idades explícitas (19 anos, 20 anos, etc.)
+ * - remove idades explícitas
  * - remove termos sensuais comuns
  * - força "adultas (18+)" quando menciona pessoas
  */
@@ -213,7 +256,7 @@ async function compressImageFile(
     quality = Math.max(minQuality, quality - 0.08);
     if (i >= 2) {
       nw = Math.max(1, Math.round(nw * 0.9));
-      nh = Math.max(1, Math.round(nh * 0.9));
+      nh = Math.max(1, Math.round(hn * 0.9));
     }
   }
 
@@ -226,8 +269,7 @@ async function compressImageFile(
 }
 
 function validateMaskPng(mask: File) {
-  const ok =
-    mask.type === "image/png" || mask.name.toLowerCase().endsWith(".png");
+  const ok = mask.type === "image/png" || mask.name.toLowerCase().endsWith(".png");
   if (!ok) throw new Error("A máscara precisa ser PNG.");
 }
 
@@ -269,11 +311,7 @@ function Segmented({
   );
 }
 
-function PresetChips({
-  onPick,
-}: {
-  onPick: (text: string) => void;
-}) {
+function PresetChips({ onPick }: { onPick: (text: string) => void }) {
   const presets = [
     {
       t: "Retrato realista • luz suave • fundo desfocado • 35mm • alto detalhe",
@@ -375,10 +413,17 @@ function ResultGrid({
   );
 }
 
+/* =========================
+   MAIN COMPONENT
+========================= */
+
 export default function DashboardClient({ userEmail }: { userEmail: string }) {
   const [tab, setTab] = useState<"generate" | "edit" | "history">("generate");
   const [loading, setLoading] = useState(false);
   const inFlightRef = useRef(false);
+
+  // ✅ FIX: state do assistente de prompt (necessário pro EditPanelPremium)
+  const [promptAssist, setPromptAssist] = useState(true);
 
   // generate
   const [prompt, setPrompt] = useState(
@@ -540,7 +585,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
 
       if (compressed !== imageFile) {
         toast.message(
-          `Otimizando imagem: ${originalMB.toFixed(1)}MB → ${compressedMB.toFixed(1)}MB`
+          `Otimizando imagem: ${originalMB.toFixed(1)}MB → ${compressedMB.toFixed(
+            1
+          )}MB`
         );
       }
 
@@ -717,8 +764,8 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
                 <div className="flex items-start gap-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
                   <Info className="mt-0.5 h-4 w-4 text-zinc-200" />
                   <div>
-                    Se der erro, reduza para <b>1024×1024</b> e <b>n=1</b>.
-                    Evite prompts com idade explícita.
+                    Se der erro, reduza para <b>1024×1024</b> e <b>n=1</b>. Evite prompts
+                    com idade explícita.
                   </div>
                 </div>
               </div>
@@ -737,6 +784,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
               editBackground={editBackground}
               setEditBackground={setEditBackground}
               onEdit={onEdit}
+              // ✅ FIX: props obrigatórias
+              promptAssist={promptAssist}
+              setPromptAssist={setPromptAssist}
             />
           )}
 
@@ -848,8 +898,8 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
                 Dica de prompt
               </div>
               <p className="mt-2 text-sm text-zinc-300">
-                Quanto mais claro, melhor: <b>estilo</b>, <b>luz</b>, <b>câmera</b>,
-                <b> fundo</b> e <b>qualidade</b>.
+                Quanto mais claro, melhor: <b>estilo</b>, <b>luz</b>, <b>câmera</b>,{" "}
+                <b>fundo</b> e <b>qualidade</b>.
               </p>
             </div>
 
@@ -938,18 +988,12 @@ function EditPanelPremium(props: {
         <div className="grid grid-cols-2 gap-3">
           <label className="grid gap-1 text-sm">
             <span className="text-zinc-300">Tamanho</span>
-            <Select
-              value={props.editSize}
-              onChange={(e) => props.setEditSize(e.target.value)}
-              disabled
-            >
+            <Select value={props.editSize} onChange={(e) => props.setEditSize(e.target.value)} disabled>
               <option value="1024x1024">1024×1024 (fixo)</option>
               <option value="1024x1536">1024×1536</option>
               <option value="1536x1024">1536×1024</option>
             </Select>
-            <p className="text-xs text-zinc-500">
-              Fixado para evitar travamentos.
-            </p>
+            <p className="text-xs text-zinc-500">Fixado para evitar travamentos.</p>
           </label>
 
           <label className="grid gap-1 text-sm">
@@ -962,9 +1006,7 @@ function EditPanelPremium(props: {
               <option value="standard">Standard (fixo)</option>
               <option value="hd">HD</option>
             </Select>
-            <p className="text-xs text-zinc-500">
-              Fixado para estabilidade no Vercel.
-            </p>
+            <p className="text-xs text-zinc-500">Fixado para estabilidade no Vercel.</p>
           </label>
         </div>
 
