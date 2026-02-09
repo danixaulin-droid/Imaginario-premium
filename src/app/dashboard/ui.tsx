@@ -158,6 +158,29 @@ function sanitizePrompt(input: string) {
 }
 
 /**
+ * Ajuda extra pra reduzir bloqueio:
+ * - adiciona sufixo seguro quando mencionar pessoas
+ */
+function applyPromptAssist(input: string) {
+  const p0 = (input || "").trim();
+  if (!p0) return p0;
+
+  const mentionsPeople =
+    /\b(mulher|mulheres|pessoa|pessoas|garota|garotas|homem|homens|casal|grupo)\b/i.test(
+      p0
+    );
+
+  const suffix =
+    " Pessoas adultas (18+), vestidas de forma discreta, sem nudez, sem conteúdo sexual, sem foco no corpo.";
+
+  if (mentionsPeople && !/sem\s+conte[uú]do\s+sexual/i.test(p0)) {
+    return `${p0}${suffix}`.trim();
+  }
+
+  return p0;
+}
+
+/**
  * Fetch com timeout + abort
  */
 async function fetchWithTimeout(
@@ -254,9 +277,11 @@ async function compressImageFile(
     if (mb <= targetMaxMB) break;
 
     quality = Math.max(minQuality, quality - 0.08);
+
+    // ✅ FIX DO BUILD: era "hn" (não existe). O certo é "nh".
     if (i >= 2) {
       nw = Math.max(1, Math.round(nw * 0.9));
-      nh = Math.max(1, Math.round(hn * 0.9));
+      nh = Math.max(1, Math.round(nh * 0.9));
     }
   }
 
@@ -422,7 +447,7 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   const [loading, setLoading] = useState(false);
   const inFlightRef = useRef(false);
 
-  // ✅ FIX: state do assistente de prompt (necessário pro EditPanelPremium)
+  // ✅ state do assistente de prompt (usado no Generate e no Edit)
   const [promptAssist, setPromptAssist] = useState(true);
 
   // generate
@@ -480,7 +505,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
         throw new Error("Digite um prompt com pelo menos 3 caracteres.");
       }
 
-      const safePrompt = sanitizePrompt(rawPrompt);
+      let safePrompt = sanitizePrompt(rawPrompt);
+      if (promptAssist) safePrompt = applyPromptAssist(safePrompt);
+
       if (safePrompt !== rawPrompt) {
         toast.message("Ajustei seu prompt para evitar bloqueio de segurança.");
       }
@@ -558,7 +585,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
 
       if (maskFile) validateMaskPng(maskFile);
 
-      const safeEditPrompt = sanitizePrompt(rawEditPrompt);
+      let safeEditPrompt = sanitizePrompt(rawEditPrompt);
+      if (promptAssist) safeEditPrompt = applyPromptAssist(safeEditPrompt);
+
       if (safeEditPrompt !== rawEditPrompt) {
         toast.message("Ajustei seu texto para evitar bloqueio de segurança.");
       }
@@ -690,6 +719,13 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
               </div>
 
               <div className="mt-4 grid gap-3">
+                <Toggle
+                  checked={promptAssist}
+                  onChange={setPromptAssist}
+                  label="Assistente de prompt (recomendado)"
+                  helper="Reduz bloqueios usando linguagem neutra e segura."
+                />
+
                 <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
                   <div className="mb-2 flex items-center gap-2 text-xs text-zinc-300">
                     <Layers className="h-4 w-4" />
@@ -784,7 +820,6 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
               editBackground={editBackground}
               setEditBackground={setEditBackground}
               onEdit={onEdit}
-              // ✅ FIX: props obrigatórias
               promptAssist={promptAssist}
               setPromptAssist={setPromptAssist}
             />
