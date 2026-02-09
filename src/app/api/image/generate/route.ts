@@ -62,17 +62,22 @@ async function debitCreditsAtomic(params: {
   const { admin, userId, cost } = params;
 
   // 0) tenta garantir linha (se tiver RPC)
+  // ✅ FIX: cast para any evita erro de tipagem quando Database não declara a RPC
   try {
-    await admin.rpc("ensure_user_credits_row", { p_user_id: userId });
+    await (admin as any).rpc("ensure_user_credits_row", { p_user_id: userId });
   } catch {
     // ignore
   }
 
   // 1) RPC preferencial
   try {
-    const rpc = await admin.rpc("debit_credits", { p_user_id: userId, p_cost: cost });
-    if (!rpc.error) {
-      const newBalance = (rpc.data ?? null) as number | null;
+    const rpc = await (admin as any).rpc("debit_credits", {
+      p_user_id: userId,
+      p_cost: cost,
+    });
+
+    if (!rpc?.error) {
+      const newBalance = (rpc?.data ?? null) as number | null;
       if (newBalance === null || Number.isNaN(newBalance)) {
         throw new Error("RPC debit_credits retornou inválido.");
       }
@@ -83,7 +88,7 @@ async function debitCreditsAtomic(params: {
   }
 
   // 2) fallback (select -> update)
-  const { data: row, error: selErr } = await admin
+  const { data: row, error: selErr } = await (admin as any)
     .from("user_credits")
     .select("balance")
     .eq("user_id", userId)
@@ -98,9 +103,9 @@ async function debitCreditsAtomic(params: {
 
   const newBalance = balance - cost;
 
-  const { error: updErr } = await admin
+  const { error: updErr } = await (admin as any)
     .from("user_credits")
-    .update({ balance: newBalance })
+    .update({ balance: newBalance } as any)
     .eq("user_id", userId);
 
   if (updErr) throw updErr;
@@ -117,15 +122,18 @@ async function refundCreditsBestEffort(params: {
 
   // 1) RPC preferencial
   try {
-    const rpc = await admin.rpc("refund_credits", { p_user_id: userId, p_cost: cost });
-    if (!rpc.error) return;
+    const rpc = await (admin as any).rpc("refund_credits", {
+      p_user_id: userId,
+      p_cost: cost,
+    });
+    if (!rpc?.error) return;
   } catch {
     // ignore
   }
 
   // 2) fallback
   try {
-    const { data: row } = await admin
+    const { data: row } = await (admin as any)
       .from("user_credits")
       .select("balance")
       .eq("user_id", userId)
@@ -134,7 +142,10 @@ async function refundCreditsBestEffort(params: {
     const balance = Number(row?.balance ?? 0);
     const newBalance = (Number.isFinite(balance) ? balance : 0) + cost;
 
-    await admin.from("user_credits").update({ balance: newBalance }).eq("user_id", userId);
+    await (admin as any)
+      .from("user_credits")
+      .update({ balance: newBalance } as any)
+      .eq("user_id", userId);
   } catch {
     // ignore
   }
@@ -149,7 +160,7 @@ async function logUsageBestEffort(params: {
 }) {
   const { admin, userId, action, creditsUsed, meta } = params;
   try {
-    await admin.from("usage_logs").insert({
+    await (admin as any).from("usage_logs").insert({
       user_id: userId,
       action,
       credits_used: creditsUsed,
@@ -278,7 +289,6 @@ export async function POST(req: Request) {
 
     const openai = getOpenAI();
 
-    // ✅ TIPAGEM: força result como any pra TS não quebrar no build
     const result: any = await withTimeout(
       (openai.images.generate({
         model: "gpt-image-1",
@@ -339,7 +349,7 @@ export async function POST(req: Request) {
     try {
       await withTimeout(
         Promise.resolve(
-          admin.from("generations").insert(
+          (admin as any).from("generations").insert(
             {
               user_id: auth.user.id,
               kind: "generate",
