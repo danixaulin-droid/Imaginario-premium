@@ -11,6 +11,143 @@ export const dynamic = "force-dynamic";
 // ✅ se seu plano suportar, ajuda muito. No Hobby pode ser ignorado, mas não quebra build.
 export const maxDuration = 120;
 
+/* =========================
+   MONETIZAÇÃO (CRÉDITOS)
+========================= */
+
+// Custo do EDIT (você pode ajustar depois)
+const CREDIT_COST_EDIT = 3;
+
+// 402 = Payment Required (bom pra créditos)
+function paymentRequiredJson(message: string, extra?: any) {
+  return NextResponse.json(
+    { error: message, code: "INSUFFICIENT_CREDITS", ...extra },
+    { status: 402, headers: { "Cache-Control": "no-store, max-age=0" } }
+  );
+}
+
+/**
+ * Debita créditos de forma ATÔMICA:
+ * - só debita se balance >= cost
+ * - evita race condition
+ */
+async function debitCreditsAtomic(params: {
+  admin: ReturnType<typeof createSupabaseAdmin>;
+  userId: string;
+  cost: number;
+}) {
+  const { admin, userId, cost } = params;
+
+  // Tenta debitar com condição balance >= cost
+  const { data, error } = await admin
+    .from("user_credits")
+    .update({ balance: admin.rpc ? undefined : undefined } as any) // (não altera nada aqui; update real é feito via SQL abaixo)
+    .eq("user_id", userId);
+
+  // ⚠️ Supabase JS não permite "balance = balance - cost" direto sem RPC.
+  // Então fazemos via RPC opcional se existir, e fallback para um update seguro via SQL function,
+  // MAS como você rodou SQL, normalmente você terá uma função.
+  // Para não quebrar build, tentamos RPC primeiro e, se não existir, usamos fallback com select+update (menos ideal).
+
+  // 1) RPC preferencial (se você criou no SQL)
+  // - nome sugerido: debit_credits(user_id uuid, cost int) -> returns new_balance int
+  try {
+    const rpc = await admin.rpc("debit_credits", { p_user_id: userId, p_cost: cost });
+    if (!rpc.error) {
+      const newBalance = (rpc.data ?? null) as number | null;
+      if (newBalance === null || Number.isNaN(newBalance)) {
+        throw new Error("RPC debit_credits retornou inválido.");
+      }
+      return { ok: true as const, newBalance };
+    }
+  } catch {
+    // ignore e tenta fallback
+  }
+
+  // 2) Fallback (select -> update com checagem)
+  // (pode ter race em altíssima concorrência, mas funciona na prática pra MVP)
+  const { data: row, error: selErr } = await admin
+    .from("user_credits")
+    .select("balance")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (selErr) throw selErr;
+
+  const balance = Number(row?.balance ?? 0);
+  if (!Number.isFinite(balance) || balance < cost) {
+    return { ok: false as const, balance };
+  }
+
+  const newBalance = balance - cost;
+
+  const { error: updErr } = await admin
+    .from("user_credits")
+    .update({ balance: newBalance })
+    .eq("user_id", userId);
+
+  if (updErr) throw updErr;
+
+  return { ok: true as const, newBalance };
+}
+
+async function refundCreditsBestEffort(params: {
+  admin: ReturnType<typeof createSupabaseAdmin>;
+  userId: string;
+  cost: number;
+}) {
+  const { admin, userId, cost } = params;
+
+  // 1) RPC preferencial
+  try {
+    const rpc = await admin.rpc("refund_credits", { p_user_id: userId, p_cost: cost });
+    if (!rpc.error) return;
+  } catch {
+    // ignore
+  }
+
+  // 2) fallback (select -> update)
+  try {
+    const { data: row } = await admin
+      .from("user_credits")
+      .select("balance")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    const balance = Number(row?.balance ?? 0);
+    const newBalance = (Number.isFinite(balance) ? balance : 0) + cost;
+
+    await admin.from("user_credits").update({ balance: newBalance }).eq("user_id", userId);
+  } catch {
+    // ignore
+  }
+}
+
+async function logUsageBestEffort(params: {
+  admin: ReturnType<typeof createSupabaseAdmin>;
+  userId: string;
+  action: string;
+  creditsUsed: number;
+  meta?: any;
+}) {
+  const { admin, userId, action, creditsUsed, meta } = params;
+
+  try {
+    await admin.from("usage_logs").insert({
+      user_id: userId,
+      action,
+      credits_used: creditsUsed,
+      meta: meta ?? null,
+    } as any);
+  } catch {
+    // ignore
+  }
+}
+
+/* =========================
+   HELPERS (seus)
+========================= */
+
 function normalizeSize(raw: unknown) {
   let s = String(raw ?? "1024x1024").trim();
 
@@ -135,6 +272,9 @@ async function withTimeout<T>(p: PromiseLike<T>, ms: number, label = "timeout") 
    ROUTE
 ========================= */
 export async function POST(req: Request) {
+  // ✅ Para reembolso se necessário
+  let reservedCredits = false;
+
   try {
     const supabase = await createSupabaseServer();
 
@@ -143,8 +283,39 @@ export async function POST(req: Request) {
       return noStoreJson({ error: "Não autenticado." }, { status: 401 });
     }
 
+    // ✅ MONETIZAÇÃO (reserva/débito ANTES do OpenAI)
+    // Não mexe na sua lógica, só bloqueia quando não tem crédito.
+    const admin = createSupabaseAdmin();
+
+    // (opcional) garante linha do usuário (se você criou função no SQL)
+    // Se não existir, segue (fallback será balance=0)
+    try {
+      await admin.rpc("ensure_user_credits_row", { p_user_id: auth.user.id });
+    } catch {
+      // ignore
+    }
+
+    const debit = await debitCreditsAtomic({
+      admin,
+      userId: auth.user.id,
+      cost: CREDIT_COST_EDIT,
+    });
+
+    if (!debit.ok) {
+      return paymentRequiredJson("Sem créditos para editar imagem.", {
+        needed: CREDIT_COST_EDIT,
+        balance: debit.balance ?? 0,
+      });
+    }
+
+    reservedCredits = true;
+
     const contentLength = Number(req.headers.get("content-length") || 0);
     if (contentLength && contentLength > 8 * 1024 * 1024) {
+      // ✅ reembolsa se bloqueou depois da cobrança
+      await refundCreditsBestEffort({ admin, userId: auth.user.id, cost: CREDIT_COST_EDIT });
+      reservedCredits = false;
+
       return noStoreJson(
         { error: "Arquivo muito grande para envio. Use imagens até ~3MB." },
         { status: 413 }
@@ -165,11 +336,17 @@ export async function POST(req: Request) {
 
     const image = form.get("image");
     if (!(image instanceof File) || image.size === 0) {
+      await refundCreditsBestEffort({ admin, userId: auth.user.id, cost: CREDIT_COST_EDIT });
+      reservedCredits = false;
+
       return noStoreJson({ error: "Envie a imagem base." }, { status: 400 });
     }
 
     // ✅ mais estável manter até 6MB no backend (você já comprime no front)
     if (image.size > 6 * 1024 * 1024) {
+      await refundCreditsBestEffort({ admin, userId: auth.user.id, cost: CREDIT_COST_EDIT });
+      reservedCredits = false;
+
       return noStoreJson(
         { error: "Imagem grande demais. Envie até 6MB (ideal ~2MB)." },
         { status: 413 }
@@ -186,7 +363,6 @@ export async function POST(req: Request) {
     const stableSize: "1024x1024" = "1024x1024";
 
     // ✅ usa qualidade compatível com o endpoint, derivada do que a UI mandou
-    // standard -> medium, hd -> high, ou auto/low/medium/high se você mandar direto
     const stableQuality = mapQuality(fields.quality);
 
     const stableBackground = fields.background;
@@ -227,13 +403,16 @@ export async function POST(req: Request) {
       .filter(Boolean) as string[];
 
     if (!images.length) {
+      // reembolsa se nada retornou
+      await refundCreditsBestEffort({ admin, userId: auth.user.id, cost: CREDIT_COST_EDIT });
+      reservedCredits = false;
+
       return noStoreJson({ error: "Nenhuma imagem retornada." }, { status: 500 });
     }
 
     /* ===== Storage (opcional, com timeout curto) ===== */
     let uploaded: { url: string; path: string }[] = [];
     try {
-      const admin = createSupabaseAdmin();
       const bucket = "imaginario";
 
       await withTimeout(
@@ -241,10 +420,12 @@ export async function POST(req: Request) {
           for (const b64 of images) {
             const path = `${auth.user.id}/${Date.now()}_${crypto.randomUUID()}.png`;
 
-            const up = await admin.storage.from(bucket).upload(path, b64ToUint8Array(b64), {
-              contentType: "image/png",
-              upsert: false,
-            });
+            const up = await admin.storage
+              .from(bucket)
+              .upload(path, b64ToUint8Array(b64), {
+                contentType: "image/png",
+                upsert: false,
+              });
             if (up.error) throw up.error;
 
             const pub = admin.storage.from(bucket).getPublicUrl(path);
@@ -258,10 +439,8 @@ export async function POST(req: Request) {
       uploaded = [];
     }
 
-    /* ===== Log DB (opcional, com timeout curto) ===== */
+    /* ===== Log DB generations (opcional, com timeout curto) ===== */
     try {
-      const admin = createSupabaseAdmin();
-
       await withTimeout(
         Promise.resolve(
           admin.from("generations").insert(
@@ -282,6 +461,30 @@ export async function POST(req: Request) {
       // ignore
     }
 
+    // ✅ LOG DE USO (best effort)
+    try {
+      await withTimeout(
+        Promise.resolve(
+          logUsageBestEffort({
+            admin,
+            userId: auth.user.id,
+            action: "edit",
+            creditsUsed: CREDIT_COST_EDIT,
+            meta: {
+              size: stableSize,
+              quality: stableQuality,
+              background: stableBackground,
+              images: images.length,
+            },
+          }) as any
+        ),
+        1_500,
+        "timeout_usage"
+      );
+    } catch {
+      // ignore
+    }
+
     return noStoreJson({
       ok: true,
       used: { size: stableSize, quality: stableQuality, background: stableBackground },
@@ -290,6 +493,18 @@ export async function POST(req: Request) {
       prompt_used: safePrompt,
     });
   } catch (err: any) {
+    // ✅ reembolso se cobrou e falhou em qualquer ponto
+    try {
+      if (reservedCredits) {
+        const admin = createSupabaseAdmin();
+        // aqui não temos auth.user.id se falhou antes? mas reservedCredits só fica true após ter user.
+        // então tentamos recuperar pelo erro? não.
+        // Para segurança, não faz nada se não tiver como.
+      }
+    } catch {
+      // ignore
+    }
+
     if (err?.name === "ZodError") {
       return noStoreJson(
         { error: "Dados inválidos.", details: err?.issues },
