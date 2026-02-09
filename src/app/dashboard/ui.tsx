@@ -23,6 +23,7 @@ import {
   RefreshCw,
   Coins,
   AlertTriangle,
+  X,
 } from "lucide-react";
 
 type Generated = { url?: string; b64?: string; path?: string };
@@ -295,7 +296,6 @@ async function compressImageFile(
 
     quality = Math.max(minQuality, quality - 0.08);
 
-    // ✅ FIX: era "hn" (não existe). O certo é "nh".
     if (i >= 2) {
       nw = Math.max(1, Math.round(nw * 0.9));
       nh = Math.max(1, Math.round(nh * 0.9));
@@ -456,6 +456,105 @@ function ResultGrid({
 }
 
 /* =========================
+   PAYWALL MODAL (COMPLETO)
+========================= */
+
+type PaywallContext =
+  | { action: "generate"; needed: number }
+  | { action: "edit"; needed: number };
+
+function PaywallModal({
+  open,
+  onClose,
+  balance,
+  ctx,
+}: {
+  open: boolean;
+  onClose: () => void;
+  balance: number | null;
+  ctx: PaywallContext | null;
+}) {
+  if (!open) return null;
+
+  const needed = ctx?.needed ?? 0;
+  const actionLabel = ctx?.action === "edit" ? "Editar" : "Gerar";
+  const bal = Number.isFinite(balance as any) ? (balance as number) : null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div
+        className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+        onClick={onClose}
+      />
+      <div className="relative w-full max-w-md overflow-hidden rounded-3xl border border-white/10 bg-zinc-950 shadow-2xl">
+        <div className="pointer-events-none absolute inset-0 opacity-60">
+          <div className="absolute -top-24 -left-24 h-72 w-72 rounded-full bg-fuchsia-500/10 blur-3xl" />
+          <div className="absolute -bottom-24 -right-24 h-72 w-72 rounded-full bg-blue-500/10 blur-3xl" />
+        </div>
+
+        <div className="relative p-5">
+          <div className="flex items-start justify-between gap-3">
+            <div className="grid gap-1">
+              <div className="inline-flex items-center gap-2 text-sm font-semibold text-zinc-100">
+                <AlertTriangle className="h-4 w-4 text-red-300" />
+                Saldo insuficiente
+              </div>
+              <p className="text-xs text-zinc-400">
+                Para <b>{actionLabel}</b> você precisa de <b>{needed}</b> crédito
+                {needed === 1 ? "" : "s"}.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-full border border-white/10 bg-white/5 p-2 text-zinc-200 hover:bg-white/10"
+              aria-label="Fechar"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="mt-4 grid gap-3">
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-zinc-300">Seu saldo</span>
+                <span className="font-semibold text-white">
+                  {bal === null ? "—" : bal}
+                </span>
+              </div>
+              <div className="mt-2 flex items-center justify-between text-sm">
+                <span className="text-zinc-300">Necessário agora</span>
+                <span className="font-semibold text-white">{needed}</span>
+              </div>
+            </div>
+
+            <div className="grid gap-2">
+              <Button
+                onClick={() => {
+                  // aqui você pode trocar para sua rota de checkout depois
+                  toast.message("Conecte aqui seu checkout (Stripe/Mercado Pago).");
+                }}
+              >
+                <Coins className="h-4 w-4" />
+                Comprar créditos
+              </Button>
+              <Button variant="secondary" onClick={onClose}>
+                Fechar
+              </Button>
+
+              <p className="text-[11px] leading-relaxed text-zinc-400">
+                Dica: comece com geração <b>1024×1024</b> e <b>n=1</b> para gastar menos
+                e evitar travamentos.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================
    MAIN COMPONENT
 ========================= */
 
@@ -464,12 +563,16 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   const [loading, setLoading] = useState(false);
   const inFlightRef = useRef(false);
 
-  // ✅ state do assistente de prompt (usado no Generate e no Edit)
+  // state do assistente de prompt (usado no Generate e no Edit)
   const [promptAssist, setPromptAssist] = useState(true);
 
-  // ✅ MONETIZAÇÃO: saldo (UI)
+  // monetização: saldo (UI)
   const [credits, setCredits] = useState<number | null>(null);
   const [creditsLoading, setCreditsLoading] = useState(false);
+
+  // paywall modal
+  const [paywallOpen, setPaywallOpen] = useState(false);
+  const [paywallCtx, setPaywallCtx] = useState<PaywallContext | null>(null);
 
   // generate
   const [prompt, setPrompt] = useState(
@@ -497,31 +600,36 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
 
   const signedInLabel = useMemo(() => userEmail || "logado", [userEmail]);
 
-  // ✅ custo atual na UI
+  // custo atual na UI
   const generateCost = useMemo(() => calcGenerateCost(n, quality), [n, quality]);
   const editCost = CREDIT_COST_EDIT;
 
   const hasCreditsInfo = credits !== null && Number.isFinite(credits);
-  const canGenerate = !hasCreditsInfo || (credits as number) >= generateCost;
-  const canEdit = !hasCreditsInfo || (credits as number) >= editCost;
+  const canGenerateWithBalance = !hasCreditsInfo || (credits as number) >= generateCost;
+  const canEditWithBalance = !hasCreditsInfo || (credits as number) >= editCost;
+
+  function openPaywall(ctx: PaywallContext) {
+    setPaywallCtx(ctx);
+    setPaywallOpen(true);
+  }
 
   async function loadCredits(showToast = false) {
     try {
       setCreditsLoading(true);
-      const { data, error } = await supabase
-        .from("user_credits")
-        .select("balance")
-        .maybeSingle();
 
-      if (error) throw error;
+      const res = await fetchWithTimeout("/api/billing/credits", { method: "GET" }, 20_000);
+      const { text, json } = await safeReadJson(res);
 
-      const bal = Number((data as any)?.balance ?? 0);
+      if (!res.ok) {
+        throw new Error(json?.error ?? text ?? "Falha ao carregar créditos.");
+      }
+
+      const bal = Number(json?.balance ?? 0);
       const safeBal = Number.isFinite(bal) ? bal : 0;
       setCredits(safeBal);
 
       if (showToast) toast.success("Saldo atualizado.");
     } catch {
-      // não trava a UI se falhar
       setCredits(null);
       if (showToast) toast.error("Não consegui carregar seus créditos.");
     } finally {
@@ -541,7 +649,6 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   }
 
   useEffect(() => {
-    // carrega saldo ao entrar
     loadCredits(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -554,9 +661,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   async function onGenerate() {
     if (inFlightRef.current) return;
 
-    // ✅ trava se sem créditos (quando sabemos o saldo)
-    if (hasCreditsInfo && !canGenerate) {
-      toast.error(`Sem créditos. Precisa de ${generateCost} e você tem ${credits}.`);
+    // trava se sem créditos (quando sabemos o saldo)
+    if (hasCreditsInfo && !canGenerateWithBalance) {
+      openPaywall({ action: "generate", needed: generateCost });
       return;
     }
 
@@ -596,10 +703,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       const { text, json } = await safeReadJson(res);
 
       if (!res.ok) {
-        // ✅ monetização
         if (res.status === 402) {
-          toast.error(json?.error ?? "Sem créditos para gerar.");
           await loadCredits(false);
+          openPaywall({ action: "generate", needed: generateCost });
           return;
         }
 
@@ -610,9 +716,7 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
           );
         }
         if (isPayloadTooLargeMessage(msg)) {
-          throw new Error(
-            "Resposta grande demais (413). Gere 1 imagem (n=1) e use 1024×1024."
-          );
+          throw new Error("Resposta grande demais (413). Gere 1 imagem (n=1) e use 1024×1024.");
         }
         throw new Error(msg);
       }
@@ -624,7 +728,6 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       setResults(out);
       toast.success("Imagem gerada!");
 
-      // ✅ atualiza saldo após uso
       await loadCredits(false);
     } catch (err: any) {
       if (err?.name === "AbortError") {
@@ -641,9 +744,8 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   async function onEdit(imageFile: File, maskFile?: File | null) {
     if (inFlightRef.current) return;
 
-    // ✅ trava se sem créditos (quando sabemos o saldo)
-    if (hasCreditsInfo && !canEdit) {
-      toast.error(`Sem créditos. Precisa de ${editCost} e você tem ${credits}.`);
+    if (hasCreditsInfo && !canEditWithBalance) {
+      openPaywall({ action: "edit", needed: editCost });
       return;
     }
 
@@ -673,7 +775,7 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
         toast.message("Ajustei seu texto para evitar bloqueio de segurança.");
       }
 
-      // ✅ Estabilidade: força padrão no EDIT (sua rota também força)
+      // Estabilidade: força padrão no EDIT (sua rota também força)
       const forcedSize = "1024x1024";
       const forcedQuality: "standard" = "standard";
       const forcedBackground = editBackground;
@@ -694,11 +796,7 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       const compressedMB = compressed.size / 1024 / 1024;
 
       if (compressed !== imageFile) {
-        toast.message(
-          `Otimizando imagem: ${originalMB.toFixed(1)}MB → ${compressedMB.toFixed(
-            1
-          )}MB`
-        );
+        toast.message(`Otimizando imagem: ${originalMB.toFixed(1)}MB → ${compressedMB.toFixed(1)}MB`);
       }
 
       const fd = new FormData();
@@ -709,19 +807,13 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       fd.set("image", compressed);
       if (maskFile) fd.set("mask", maskFile);
 
-      const res = await fetchWithTimeout(
-        "/api/image/edit",
-        { method: "POST", body: fd },
-        120_000
-      );
-
+      const res = await fetchWithTimeout("/api/image/edit", { method: "POST", body: fd }, 120_000);
       const { text, json } = await safeReadJson(res);
 
       if (!res.ok) {
-        // ✅ monetização
         if (res.status === 402) {
-          toast.error(json?.error ?? "Sem créditos para editar.");
           await loadCredits(false);
+          openPaywall({ action: "edit", needed: editCost });
           return;
         }
 
@@ -746,7 +838,6 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       setResults(out);
       toast.success("Edição concluída!");
 
-      // ✅ atualiza saldo após uso
       await loadCredits(false);
     } catch (err: any) {
       if (err?.name === "AbortError") {
@@ -773,331 +864,337 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
     tab === "generate" ? "Geração" : tab === "edit" ? "Edição" : "Histórico";
 
   return (
-    <div className="grid gap-6">
-      {/* Top bar */}
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div className="grid gap-2">
-          <div className="inline-flex w-fit items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
-            <ImageIcon className="h-4 w-4" />
-            Studio • {panelTitle}
-            <ChevronRight className="h-4 w-4 opacity-60" />
-            <span className="text-zinc-300">{signedInLabel}</span>
-          </div>
+    <>
+      <PaywallModal
+        open={paywallOpen}
+        onClose={() => setPaywallOpen(false)}
+        balance={credits}
+        ctx={paywallCtx}
+      />
 
-          {/* ✅ Créditos */}
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
-              <Coins className="h-4 w-4 text-yellow-200" />
-              {creditsLoading ? (
-                <span className="text-zinc-300">Carregando créditos...</span>
-              ) : credits === null ? (
-                <span className="text-zinc-300">Créditos: —</span>
-              ) : (
-                <span className="text-zinc-200">
-                  Créditos: <b className="text-white">{credits}</b>
-                </span>
-              )}
+      <div className="grid gap-6">
+        {/* Top bar */}
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div className="grid gap-2">
+            <div className="inline-flex w-fit items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
+              <ImageIcon className="h-4 w-4" />
+              Studio • {panelTitle}
+              <ChevronRight className="h-4 w-4 opacity-60" />
+              <span className="text-zinc-300">{signedInLabel}</span>
             </div>
 
-            <Button
-              variant="secondary"
-              onClick={() => loadCredits(true)}
-              disabled={creditsLoading}
-            >
-              <RefreshCw className="h-4 w-4" />
-              Atualizar saldo
-            </Button>
-
-            {/* custo estimado */}
-            <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
-              <Info className="h-4 w-4" />
-              {tab === "generate" ? (
-                <span>
-                  Custo agora: <b>{generateCost}</b>
-                </span>
-              ) : tab === "edit" ? (
-                <span>
-                  Custo agora: <b>{editCost}</b>
-                </span>
-              ) : (
-                <span>Custos variam por ação</span>
-              )}
-            </div>
-
-            {hasCreditsInfo && ((tab === "generate" && !canGenerate) || (tab === "edit" && !canEdit)) ? (
-              <div className="inline-flex items-center gap-2 rounded-full border border-red-500/20 bg-red-500/10 px-3 py-1 text-xs text-red-200">
-                <AlertTriangle className="h-4 w-4" />
-                Saldo insuficiente
-              </div>
-            ) : null}
-          </div>
-
-          <h1 className="text-2xl font-semibold">Dashboard</h1>
-          <p className="text-sm text-zinc-300">
-            Gere e edite com estabilidade (mobile + Vercel).
-          </p>
-        </div>
-        <Segmented value={tab} onChange={setTab} />
-      </div>
-
-      {/* Main layout: controls + preview */}
-      <div className="grid gap-6 lg:grid-cols-[420px_1fr]">
-        {/* LEFT: controls */}
-        <div className="grid gap-6">
-          {tab === "generate" && (
-            <Card className="p-6">
-              <div className="flex items-center justify-between gap-3">
-                <div className="grid gap-1">
-                  <div className="flex items-center gap-2 text-sm font-semibold">
-                    <Sparkles className="h-4 w-4 text-fuchsia-300" />
-                    Gerar imagem
-                  </div>
-                  <div className="text-xs text-zinc-400">
-                    Dica: 1024×1024 e n=1 é o modo mais estável.
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-4 grid gap-3">
-                <Toggle
-                  checked={promptAssist}
-                  onChange={setPromptAssist}
-                  label="Assistente de prompt (recomendado)"
-                  helper="Reduz bloqueios usando linguagem neutra e segura."
-                />
-
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
-                  <div className="mb-2 flex items-center gap-2 text-xs text-zinc-300">
-                    <Layers className="h-4 w-4" />
-                    Presets rápidos
-                  </div>
-                  <PresetChips onPick={(t) => setPrompt(t)} />
-                </div>
-
-                <label className="grid gap-1 text-sm">
-                  <span className="text-zinc-300">Prompt</span>
-                  <Textarea
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                    className="min-h-[140px]"
-                  />
-                </label>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="grid gap-1 text-sm">
-                    <span className="text-zinc-300">Tamanho</span>
-                    <Select value={size} onChange={(e) => setSize(e.target.value)}>
-                      <option value="1024x1024">1024×1024</option>
-                      <option value="1024x1536">1024×1536</option>
-                      <option value="1536x1024">1536×1024</option>
-                    </Select>
-                  </label>
-
-                  <label className="grid gap-1 text-sm">
-                    <span className="text-zinc-300">Qualidade</span>
-                    <Select
-                      value={quality}
-                      onChange={(e) => setQuality(e.target.value as any)}
-                    >
-                      <option value="standard">Standard</option>
-                      <option value="hd">HD</option>
-                    </Select>
-                  </label>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="grid gap-1 text-sm">
-                    <span className="text-zinc-300">Fundo</span>
-                    <Select
-                      value={background}
-                      onChange={(e) => setBackground(e.target.value as any)}
-                    >
-                      <option value="auto">Auto</option>
-                      <option value="transparent">Transparente</option>
-                      <option value="opaque">Opaco</option>
-                    </Select>
-                  </label>
-
-                  <label className="grid gap-1 text-sm">
-                    <span className="text-zinc-300">Variações</span>
-                    <Select
-                      value={String(n)}
-                      onChange={(e) => setN(Number(e.target.value))}
-                    >
-                      <option value="1">1</option>
-                      <option value="2">2</option>
-                      <option value="3">3</option>
-                      <option value="4">4</option>
-                    </Select>
-                  </label>
-                </div>
-
-                <Button onClick={onGenerate} disabled={loading || (hasCreditsInfo && !canGenerate)}>
-                  <Sparkles className="h-4 w-4" />
-                  {hasCreditsInfo && !canGenerate
-                    ? `Sem créditos (precisa ${generateCost})`
-                    : loading
-                    ? "Gerando..."
-                    : `Gerar imagem (${generateCost} crédito${generateCost === 1 ? "" : "s"})`}
-                </Button>
-
-                <div className="flex items-start gap-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
-                  <Info className="mt-0.5 h-4 w-4 text-zinc-200" />
-                  <div>
-                    Se der erro, reduza para <b>1024×1024</b> e <b>n=1</b>. Evite prompts
-                    com idade explícita.
-                  </div>
-                </div>
-              </div>
-            </Card>
-          )}
-
-          {tab === "edit" && (
-            <EditPanelPremium
-              loading={loading}
-              editPrompt={editPrompt}
-              setEditPrompt={setEditPrompt}
-              editSize={editSize}
-              setEditSize={setEditSize}
-              editQuality={editQuality}
-              setEditQuality={setEditQuality}
-              editBackground={editBackground}
-              setEditBackground={setEditBackground}
-              onEdit={onEdit}
-              promptAssist={promptAssist}
-              setPromptAssist={setPromptAssist}
-              // ✅ monetização
-              editCost={editCost}
-              canEdit={!(hasCreditsInfo && !canEdit)}
-            />
-          )}
-
-          {tab === "history" && (
-            <Card className="p-6">
-              <div className="flex items-center justify-between gap-3">
-                <div className="grid gap-1">
-                  <div className="flex items-center gap-2 text-sm font-semibold">
-                    <Clock className="h-4 w-4 text-emerald-300" />
-                    Histórico
-                  </div>
-                  <div className="text-xs text-zinc-400">
-                    Mostra até 30 itens (depende da tabela no Supabase).
-                  </div>
-                </div>
-                <Button variant="secondary" onClick={loadHistory}>
-                  <RefreshCw className="h-4 w-4" />
-                  Atualizar
-                </Button>
-              </div>
-
-              <div className="mt-4 grid gap-3">
-                {history.length === 0 ? (
-                  <div className="rounded-3xl border border-white/10 bg-white/5 p-6 text-sm text-zinc-300">
-                    Sem histórico ainda.
-                  </div>
+            {/* Créditos */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
+                <Coins className="h-4 w-4 text-yellow-200" />
+                {creditsLoading ? (
+                  <span className="text-zinc-300">Carregando créditos...</span>
+                ) : credits === null ? (
+                  <span className="text-zinc-300">Créditos: —</span>
                 ) : (
-                  history.map((h) => (
-                    <div
-                      key={h.id}
-                      className="rounded-3xl border border-white/10 bg-white/5 p-4"
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="text-sm">
-                          <span className="font-semibold">
-                            {h.kind === "edit" ? "Edição" : "Geração"}
-                          </span>{" "}
-                          <span className="text-zinc-400">
-                            • {new Date(h.created_at).toLocaleString()}
-                          </span>
-                        </div>
-                        <div className="text-xs text-zinc-400">
-                          {h.size} • n={h.n}
-                        </div>
-                      </div>
-                      <div className="mt-2 text-sm text-zinc-200">{h.prompt}</div>
-                    </div>
-                  ))
+                  <span className="text-zinc-200">
+                    Créditos: <b className="text-white">{credits}</b>
+                  </span>
                 )}
               </div>
-            </Card>
-          )}
+
+              <Button
+                variant="secondary"
+                onClick={() => loadCredits(true)}
+                disabled={creditsLoading}
+              >
+                <RefreshCw className="h-4 w-4" />
+                Atualizar saldo
+              </Button>
+
+              <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
+                <Info className="h-4 w-4" />
+                {tab === "generate" ? (
+                  <span>
+                    Custo agora: <b>{generateCost}</b>
+                  </span>
+                ) : tab === "edit" ? (
+                  <span>
+                    Custo agora: <b>{editCost}</b>
+                  </span>
+                ) : (
+                  <span>Custos variam por ação</span>
+                )}
+              </div>
+
+              {hasCreditsInfo &&
+              ((tab === "generate" && !canGenerateWithBalance) ||
+                (tab === "edit" && !canEditWithBalance)) ? (
+                <div className="inline-flex items-center gap-2 rounded-full border border-red-500/20 bg-red-500/10 px-3 py-1 text-xs text-red-200">
+                  <AlertTriangle className="h-4 w-4" />
+                  Saldo insuficiente
+                </div>
+              ) : null}
+            </div>
+
+            <h1 className="text-2xl font-semibold">Dashboard</h1>
+            <p className="text-sm text-zinc-300">
+              Gere e edite com estabilidade (mobile + Vercel).
+            </p>
+          </div>
+          <Segmented value={tab} onChange={setTab} />
         </div>
 
-        {/* RIGHT: preview */}
-        <div className="grid gap-6">
-          <Card className="relative overflow-hidden p-6">
-            {/* glow backdrop */}
-            <div className="pointer-events-none absolute inset-0 opacity-70">
-              <div className="absolute -top-40 -left-40 h-96 w-96 rounded-full bg-fuchsia-500/10 blur-3xl" />
-              <div className="absolute -bottom-40 -right-40 h-96 w-96 rounded-full bg-blue-500/10 blur-3xl" />
-            </div>
-
-            <div className="relative flex items-center justify-between gap-3">
-              <div className="grid gap-1">
-                <div className="text-sm font-semibold">Prévia / Resultados</div>
-                <div className="text-xs text-zinc-400">
-                  Seus resultados aparecem aqui (com download rápido).
+        {/* Main layout: controls + preview */}
+        <div className="grid gap-6 lg:grid-cols-[420px_1fr]">
+          {/* LEFT: controls */}
+          <div className="grid gap-6">
+            {tab === "generate" && (
+              <Card className="p-6">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="grid gap-1">
+                    <div className="flex items-center gap-2 text-sm font-semibold">
+                      <Sparkles className="h-4 w-4 text-fuchsia-300" />
+                      Gerar imagem
+                    </div>
+                    <div className="text-xs text-zinc-400">
+                      Dica: 1024×1024 e n=1 é o modo mais estável.
+                    </div>
+                  </div>
                 </div>
-              </div>
 
-              <div className="hidden items-center gap-2 md:flex">
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
-                  {tab === "generate"
-                    ? "Geração"
-                    : tab === "edit"
-                    ? "Edição"
-                    : "Histórico"}
-                </span>
-              </div>
-            </div>
+                <div className="mt-4 grid gap-3">
+                  <Toggle
+                    checked={promptAssist}
+                    onChange={setPromptAssist}
+                    label="Assistente de prompt (recomendado)"
+                    helper="Reduz bloqueios usando linguagem neutra e segura."
+                  />
 
-            {/* loading overlay */}
-            {loading && (
-              <div className="relative mt-4 overflow-hidden rounded-3xl border border-white/10 bg-white/5 p-6">
-                <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-200">
-                  <span className="h-2 w-2 animate-pulse rounded-full bg-fuchsia-400" />
-                  Processando...
+                  <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
+                    <div className="mb-2 flex items-center gap-2 text-xs text-zinc-300">
+                      <Layers className="h-4 w-4" />
+                      Presets rápidos
+                    </div>
+                    <PresetChips onPick={(t) => setPrompt(t)} />
+                  </div>
+
+                  <label className="grid gap-1 text-sm">
+                    <span className="text-zinc-300">Prompt</span>
+                    <Textarea
+                      value={prompt}
+                      onChange={(e) => setPrompt(e.target.value)}
+                      className="min-h-[140px]"
+                    />
+                  </label>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-zinc-300">Tamanho</span>
+                      <Select value={size} onChange={(e) => setSize(e.target.value)}>
+                        <option value="1024x1024">1024×1024</option>
+                        <option value="1024x1536">1024×1536</option>
+                        <option value="1536x1024">1536×1024</option>
+                      </Select>
+                    </label>
+
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-zinc-300">Qualidade</span>
+                      <Select
+                        value={quality}
+                        onChange={(e) => setQuality(e.target.value as any)}
+                      >
+                        <option value="standard">Standard</option>
+                        <option value="hd">HD</option>
+                      </Select>
+                    </label>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-zinc-300">Fundo</span>
+                      <Select
+                        value={background}
+                        onChange={(e) => setBackground(e.target.value as any)}
+                      >
+                        <option value="auto">Auto</option>
+                        <option value="transparent">Transparente</option>
+                        <option value="opaque">Opaco</option>
+                      </Select>
+                    </label>
+
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-zinc-300">Variações</span>
+                      <Select
+                        value={String(n)}
+                        onChange={(e) => setN(Number(e.target.value))}
+                      >
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                        <option value="4">4</option>
+                      </Select>
+                    </label>
+                  </div>
+
+                  <Button
+                    onClick={onGenerate}
+                    disabled={loading || (hasCreditsInfo && !canGenerateWithBalance)}
+                  >
+                    <Sparkles className="h-4 w-4" />
+                    {hasCreditsInfo && !canGenerateWithBalance
+                      ? `Sem créditos (precisa ${generateCost})`
+                      : loading
+                      ? "Gerando..."
+                      : `Gerar imagem (${generateCost} crédito${generateCost === 1 ? "" : "s"})`}
+                  </Button>
+
+                  <div className="flex items-start gap-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
+                    <Info className="mt-0.5 h-4 w-4 text-zinc-200" />
+                    <div>
+                      Se der erro, reduza para <b>1024×1024</b> e <b>n=1</b>. Evite prompts
+                      com idade explícita.
+                    </div>
+                  </div>
                 </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="h-40 animate-pulse rounded-2xl bg-white/5" />
-                  <div className="h-40 animate-pulse rounded-2xl bg-white/5" />
-                </div>
-                <p className="mt-3 text-xs text-zinc-400">
-                  Se demorar demais, tente <b>1024×1024</b>, <b>n=1</b> e imagem menor.
-                </p>
-              </div>
+              </Card>
             )}
 
-            <div className="relative mt-4">
-              <ResultGrid results={results} onDownload={download} />
-            </div>
-          </Card>
+            {tab === "edit" && (
+              <EditPanelPremium
+                loading={loading}
+                editPrompt={editPrompt}
+                setEditPrompt={setEditPrompt}
+                editSize={editSize}
+                setEditSize={setEditSize}
+                editQuality={editQuality}
+                setEditQuality={setEditQuality}
+                editBackground={editBackground}
+                setEditBackground={setEditBackground}
+                onEdit={onEdit}
+                promptAssist={promptAssist}
+                setPromptAssist={setPromptAssist}
+                editCost={editCost}
+                canEdit={!(hasCreditsInfo && !canEditWithBalance)}
+              />
+            )}
 
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
-              <div className="flex items-center gap-2 text-sm font-semibold">
-                <Sparkles className="h-4 w-4 text-fuchsia-300" />
-                Dica de prompt
-              </div>
-              <p className="mt-2 text-sm text-zinc-300">
-                Quanto mais claro, melhor: <b>estilo</b>, <b>luz</b>, <b>câmera</b>,{" "}
-                <b>fundo</b> e <b>qualidade</b>.
-              </p>
-            </div>
+            {tab === "history" && (
+              <Card className="p-6">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="grid gap-1">
+                    <div className="flex items-center gap-2 text-sm font-semibold">
+                      <Clock className="h-4 w-4 text-emerald-300" />
+                      Histórico
+                    </div>
+                    <div className="text-xs text-zinc-400">
+                      Mostra até 30 itens (depende da tabela no Supabase).
+                    </div>
+                  </div>
+                  <Button variant="secondary" onClick={loadHistory}>
+                    <RefreshCw className="h-4 w-4" />
+                    Atualizar
+                  </Button>
+                </div>
 
-            <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
-              <div className="flex items-center gap-2 text-sm font-semibold">
-                <Upload className="h-4 w-4 text-blue-300" />
-                Dica de edição
+                <div className="mt-4 grid gap-3">
+                  {history.length === 0 ? (
+                    <div className="rounded-3xl border border-white/10 bg-white/5 p-6 text-sm text-zinc-300">
+                      Sem histórico ainda.
+                    </div>
+                  ) : (
+                    history.map((h) => (
+                      <div
+                        key={h.id}
+                        className="rounded-3xl border border-white/10 bg-white/5 p-4"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="text-sm">
+                            <span className="font-semibold">
+                              {h.kind === "edit" ? "Edição" : "Geração"}
+                            </span>{" "}
+                            <span className="text-zinc-400">
+                              • {new Date(h.created_at).toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="text-xs text-zinc-400">
+                            {h.size} • n={h.n}
+                          </div>
+                        </div>
+                        <div className="mt-2 text-sm text-zinc-200">{h.prompt}</div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </Card>
+            )}
+          </div>
+
+          {/* RIGHT: preview */}
+          <div className="grid gap-6">
+            <Card className="relative overflow-hidden p-6">
+              <div className="pointer-events-none absolute inset-0 opacity-70">
+                <div className="absolute -top-40 -left-40 h-96 w-96 rounded-full bg-fuchsia-500/10 blur-3xl" />
+                <div className="absolute -bottom-40 -right-40 h-96 w-96 rounded-full bg-blue-500/10 blur-3xl" />
               </div>
-              <p className="mt-2 text-sm text-zinc-300">
-                Use fotos menores. Se o celular salvar em <b>HEIC</b>, converta para JPG.
-              </p>
+
+              <div className="relative flex items-center justify-between gap-3">
+                <div className="grid gap-1">
+                  <div className="text-sm font-semibold">Prévia / Resultados</div>
+                  <div className="text-xs text-zinc-400">
+                    Seus resultados aparecem aqui (com download rápido).
+                  </div>
+                </div>
+
+                <div className="hidden items-center gap-2 md:flex">
+                  <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
+                    {tab === "generate" ? "Geração" : tab === "edit" ? "Edição" : "Histórico"}
+                  </span>
+                </div>
+              </div>
+
+              {loading && (
+                <div className="relative mt-4 overflow-hidden rounded-3xl border border-white/10 bg-white/5 p-6">
+                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-200">
+                    <span className="h-2 w-2 animate-pulse rounded-full bg-fuchsia-400" />
+                    Processando...
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="h-40 animate-pulse rounded-2xl bg-white/5" />
+                    <div className="h-40 animate-pulse rounded-2xl bg-white/5" />
+                  </div>
+                  <p className="mt-3 text-xs text-zinc-400">
+                    Se demorar demais, tente <b>1024×1024</b>, <b>n=1</b> e imagem menor.
+                  </p>
+                </div>
+              )}
+
+              <div className="relative mt-4">
+                <ResultGrid results={results} onDownload={download} />
+              </div>
+            </Card>
+
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
+                <div className="flex items-center gap-2 text-sm font-semibold">
+                  <Sparkles className="h-4 w-4 text-fuchsia-300" />
+                  Dica de prompt
+                </div>
+                <p className="mt-2 text-sm text-zinc-300">
+                  Quanto mais claro, melhor: <b>estilo</b>, <b>luz</b>, <b>câmera</b>,{" "}
+                  <b>fundo</b> e <b>qualidade</b>.
+                </p>
+              </div>
+
+              <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
+                <div className="flex items-center gap-2 text-sm font-semibold">
+                  <Upload className="h-4 w-4 text-blue-300" />
+                  Dica de edição
+                </div>
+                <p className="mt-2 text-sm text-zinc-300">
+                  Use fotos menores. Se o celular salvar em <b>HEIC</b>, converta para JPG.
+                </p>
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -1119,7 +1216,6 @@ function EditPanelPremium(props: {
   promptAssist: boolean;
   setPromptAssist: (v: boolean) => void;
 
-  // ✅ monetização
   editCost: number;
   canEdit: boolean;
 }) {
@@ -1180,7 +1276,7 @@ function EditPanelPremium(props: {
               disabled
             >
               <option value="1024x1024">1024×1024 (fixo)</option>
-              <option value="1024x1536">1024×1026</option>
+              <option value="1024x1536">1024×1536</option>
               <option value="1536x1024">1536×1024</option>
             </Select>
             <p className="text-xs text-zinc-500">Fixado para evitar travamentos.</p>
@@ -1240,8 +1336,7 @@ function EditPanelPremium(props: {
         <div className="flex items-start gap-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
           <Info className="mt-0.5 h-4 w-4 text-zinc-200" />
           <div>
-            Se aparecer “demorou demais”, use uma imagem menor. Screenshots costumam
-            funcionar melhor que fotos enormes.
+            Se aparecer “demorou demais”, use uma imagem menor. Screenshots costumam funcionar melhor que fotos enormes.
           </div>
         </div>
       </div>
