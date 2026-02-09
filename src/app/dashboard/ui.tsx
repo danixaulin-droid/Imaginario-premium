@@ -607,6 +607,21 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   const [loading, setLoading] = useState(false);
   const inFlightRef = useRef(false);
 
+  // ✅ ref da área de prévia (para rolar no mobile)
+  const previewRef = useRef<HTMLDivElement | null>(null);
+
+  function scrollToPreview() {
+    setTimeout(() => {
+      previewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 80);
+  }
+
+  function showInPreview(imgs: Generated[]) {
+    setResults(imgs);
+    toast.message("Carreguei as imagens na prévia.");
+    scrollToPreview();
+  }
+
   // state do assistente de prompt (usado no Generate e no Edit)
   const [promptAssist, setPromptAssist] = useState(true);
 
@@ -774,6 +789,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       setResults(out);
       toast.success("Imagem gerada!");
 
+      // ✅ joga o usuário pra prévia no mobile
+      scrollToPreview();
+
       await loadCredits(false);
     } catch (err: any) {
       if (err?.name === "AbortError") {
@@ -842,7 +860,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       const compressedMB = compressed.size / 1024 / 1024;
 
       if (compressed !== imageFile) {
-        toast.message(`Otimizando imagem: ${originalMB.toFixed(1)}MB → ${compressedMB.toFixed(1)}MB`);
+        toast.message(
+          `Otimizando imagem: ${originalMB.toFixed(1)}MB → ${compressedMB.toFixed(1)}MB`
+        );
       }
 
       const fd = new FormData();
@@ -884,6 +904,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       setResults(out);
       toast.success("Edição concluída!");
 
+      // ✅ joga o usuário pra prévia no mobile
+      scrollToPreview();
+
       await loadCredits(false);
     } catch (err: any) {
       if (err?.name === "AbortError") {
@@ -897,13 +920,53 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
     }
   }
 
+  // ✅ download melhor no Android
   async function download(item: Generated) {
-    const href = item.url || (item.b64 ? dataUrlFromB64(item.b64) : "");
-    if (!href) return;
-    const a = document.createElement("a");
-    a.href = href;
-    a.download = "imagem.png";
-    a.click();
+    try {
+      if (item.b64) {
+        const a = document.createElement("a");
+        a.href = dataUrlFromB64(item.b64);
+        a.download = "imagem.png";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        return;
+      }
+
+      if (item.url) {
+        const res = await fetch(item.url, { cache: "no-store" });
+        if (!res.ok) throw new Error("Falha ao baixar.");
+
+        const blob = await res.blob();
+        const objectUrl = URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.href = objectUrl;
+
+        const ext = blob.type.includes("png")
+          ? "png"
+          : blob.type.includes("webp")
+          ? "webp"
+          : "jpg";
+
+        a.download = `imagem.${ext}`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        URL.revokeObjectURL(objectUrl);
+        return;
+      }
+
+      toast.error("Sem arquivo para baixar.");
+    } catch {
+      if (item.url) {
+        window.open(item.url, "_blank", "noopener,noreferrer");
+        toast.message("Abri a imagem. Se não baixar automático, use o menu do navegador.");
+        return;
+      }
+      toast.error("Não consegui baixar.");
+    }
   }
 
   const panelTitle =
@@ -1087,7 +1150,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
                       ? `Sem créditos (precisa ${generateCost})`
                       : loading
                       ? "Gerando..."
-                      : `Gerar imagem (${generateCost} crédito${generateCost === 1 ? "" : "s"})`}
+                      : `Gerar imagem (${generateCost} crédito${
+                          generateCost === 1 ? "" : "s"
+                        })`}
                   </Button>
 
                   <div className="flex items-start gap-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
@@ -1180,10 +1245,7 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
                                     key={`${h.id}_${idx}`}
                                     type="button"
                                     className="relative overflow-hidden rounded-2xl border border-white/10 bg-black"
-                                    onClick={() => {
-                                      setResults(imgs);
-                                      toast.message("Carreguei as imagens na prévia.");
-                                    }}
+                                    onClick={() => showInPreview(imgs)}
                                     title="Ver na prévia"
                                   >
                                     {src ? (
@@ -1211,10 +1273,7 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
                           <div className="mt-3 flex flex-wrap gap-2">
                             <Button
                               variant="secondary"
-                              onClick={() => {
-                                setResults(imgs);
-                                toast.message("Carreguei as imagens na prévia.");
-                              }}
+                              onClick={() => showInPreview(imgs)}
                               disabled={imgs.length === 0}
                             >
                               <ImagePlus className="h-4 w-4" />
@@ -1241,47 +1300,54 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
 
           {/* RIGHT: preview */}
           <div className="grid gap-6">
-            <Card className="relative overflow-hidden p-6">
-              <div className="pointer-events-none absolute inset-0 opacity-70">
-                <div className="absolute -top-40 -left-40 h-96 w-96 rounded-full bg-fuchsia-500/10 blur-3xl" />
-                <div className="absolute -bottom-40 -right-40 h-96 w-96 rounded-full bg-blue-500/10 blur-3xl" />
-              </div>
+            {/* ✅ wrapper com ref para rolar até aqui */}
+            <div ref={previewRef}>
+              <Card className="relative overflow-hidden p-6">
+                <div className="pointer-events-none absolute inset-0 opacity-70">
+                  <div className="absolute -top-40 -left-40 h-96 w-96 rounded-full bg-fuchsia-500/10 blur-3xl" />
+                  <div className="absolute -bottom-40 -right-40 h-96 w-96 rounded-full bg-blue-500/10 blur-3xl" />
+                </div>
 
-              <div className="relative flex items-center justify-between gap-3">
-                <div className="grid gap-1">
-                  <div className="text-sm font-semibold">Prévia / Resultados</div>
-                  <div className="text-xs text-zinc-400">
-                    Seus resultados aparecem aqui (com download rápido).
+                <div className="relative flex items-center justify-between gap-3">
+                  <div className="grid gap-1">
+                    <div className="text-sm font-semibold">Prévia / Resultados</div>
+                    <div className="text-xs text-zinc-400">
+                      Seus resultados aparecem aqui (com download rápido).
+                    </div>
+                  </div>
+
+                  <div className="hidden items-center gap-2 md:flex">
+                    <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
+                      {tab === "generate"
+                        ? "Geração"
+                        : tab === "edit"
+                        ? "Edição"
+                        : "Histórico"}
+                    </span>
                   </div>
                 </div>
 
-                <div className="hidden items-center gap-2 md:flex">
-                  <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
-                    {tab === "generate" ? "Geração" : tab === "edit" ? "Edição" : "Histórico"}
-                  </span>
-                </div>
-              </div>
-
-              {loading && (
-                <div className="relative mt-4 overflow-hidden rounded-3xl border border-white/10 bg-white/5 p-6">
-                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-200">
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-fuchsia-400" />
-                    Processando...
+                {loading && (
+                  <div className="relative mt-4 overflow-hidden rounded-3xl border border-white/10 bg-white/5 p-6">
+                    <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-200">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-fuchsia-400" />
+                      Processando...
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="h-40 animate-pulse rounded-2xl bg-white/5" />
+                      <div className="h-40 animate-pulse rounded-2xl bg-white/5" />
+                    </div>
+                    <p className="mt-3 text-xs text-zinc-400">
+                      Se demorar demais, tente <b>1024×1024</b>, <b>n=1</b> e imagem menor.
+                    </p>
                   </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="h-40 animate-pulse rounded-2xl bg-white/5" />
-                    <div className="h-40 animate-pulse rounded-2xl bg-white/5" />
-                  </div>
-                  <p className="mt-3 text-xs text-zinc-400">
-                    Se demorar demais, tente <b>1024×1024</b>, <b>n=1</b> e imagem menor.
-                  </p>
-                </div>
-              )}
+                )}
 
-              <div className="relative mt-4">
-                <ResultGrid results={results} onDownload={download} />
-              </div>
-            </Card>
+                <div className="relative mt-4">
+                  <ResultGrid results={results} onDownload={download} />
+                </div>
+              </Card>
+            </div>
 
             <div className="grid gap-4 md:grid-cols-2">
               <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
