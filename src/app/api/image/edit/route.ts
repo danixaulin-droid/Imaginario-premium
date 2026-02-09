@@ -32,17 +32,22 @@ async function debitCreditsAtomic(params: {
 
   // 1) tenta RPC (se existir no seu SQL)
   try {
-    const rpc = await admin.rpc("debit_credits", { p_user_id: userId, p_cost: cost });
+    const rpc = await admin.rpc("debit_credits", {
+      p_user_id: userId,
+      p_cost: cost,
+    });
     if (!rpc.error) {
       const newBalance = (rpc.data ?? null) as number | null;
-      if (newBalance === null || Number.isNaN(newBalance)) throw new Error("RPC inválido");
+      if (newBalance === null || Number.isNaN(newBalance)) {
+        throw new Error("RPC inválido");
+      }
       return { ok: true as const, newBalance };
     }
   } catch {
     // ignora e cai no fallback
   }
 
-  // 2) fallback: select -> update (SEM gambiarra)
+  // 2) fallback: select -> update
   const { data: row, error: selErr } = await admin
     .from("user_credits")
     .select("balance")
@@ -51,7 +56,7 @@ async function debitCreditsAtomic(params: {
 
   if (selErr) throw selErr;
 
-  const balance = Number(row?.balance ?? 0);
+  const balance = Number((row as any)?.balance ?? 0);
   if (!Number.isFinite(balance) || balance < cost) {
     return { ok: false as const, balance: Number.isFinite(balance) ? balance : 0 };
   }
@@ -77,7 +82,10 @@ async function refundCreditsBestEffort(params: {
 
   // tenta RPC
   try {
-    const rpc = await admin.rpc("refund_credits", { p_user_id: userId, p_cost: cost });
+    const rpc = await admin.rpc("refund_credits", {
+      p_user_id: userId,
+      p_cost: cost,
+    });
     if (!rpc.error) return;
   } catch {
     // ignore
@@ -91,7 +99,7 @@ async function refundCreditsBestEffort(params: {
       .eq("user_id", userId)
       .maybeSingle();
 
-    const balance = Number(row?.balance ?? 0);
+    const balance = Number((row as any)?.balance ?? 0);
     const newBalance = (Number.isFinite(balance) ? balance : 0) + cost;
 
     await admin.from("user_credits").update({ balance: newBalance }).eq("user_id", userId);
@@ -116,7 +124,9 @@ const FieldsSchema = z.object({
   prompt: z.string().min(3).max(2000),
   size: z.enum(["1024x1024", "1024x1536", "1536x1024"]).default("1024x1024"),
   background: z.enum(["auto", "transparent", "opaque"]).default("auto"),
-  quality: z.enum(["standard", "hd", "auto", "low", "medium", "high"]).default("standard"),
+  quality: z
+    .enum(["standard", "hd", "auto", "low", "medium", "high"])
+    .default("standard"),
 });
 
 // endpoint de edit aceita: auto | low | medium | high
@@ -216,8 +226,9 @@ export async function POST(req: Request) {
       return noStoreJson({ error: "Não autenticado." }, { status: 401 });
     }
 
+    // ✅ FIX: removeu "_toggle" que quebrava build
     const contentLength = Number(req.headers.get("content-length") || 0);
-    if (contentLength && contentLength > 8 * 1024 * 1024_toggle) {
+    if (contentLength && contentLength > 8 * 1024 * 1024) {
       return noStoreJson(
         { error: "Arquivo muito grande para envio. Use imagens até ~3MB." },
         { status: 413 }
