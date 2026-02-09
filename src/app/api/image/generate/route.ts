@@ -26,6 +26,141 @@ function b64ToUint8Array(b64: string) {
 }
 
 /* =========================
+   MONETIZAÇÃO (CRÉDITOS)
+========================= */
+
+// ✅ custo base por imagem gerada
+const CREDIT_COST_PER_IMAGE = 1;
+
+// ✅ extra por HD (por imagem)
+const CREDIT_EXTRA_HD_PER_IMAGE = 1;
+
+function calcGenerateCost(n: number, quality: "standard" | "hd") {
+  const base = n * CREDIT_COST_PER_IMAGE;
+  const extra = quality === "hd" ? n * CREDIT_EXTRA_HD_PER_IMAGE : 0;
+  return base + extra;
+}
+
+// 402 = Payment Required
+function paymentRequiredJson(message: string, extra?: any) {
+  return NextResponse.json(
+    { error: message, code: "INSUFFICIENT_CREDITS", ...extra },
+    { status: 402, headers: { "Cache-Control": "no-store, max-age=0" } }
+  );
+}
+
+/**
+ * Debita créditos de forma preferencial via RPC (se existir):
+ * - debit_credits(p_user_id uuid, p_cost int) -> returns new_balance int
+ * fallback: select + update (MVP)
+ */
+async function debitCreditsAtomic(params: {
+  admin: ReturnType<typeof createSupabaseAdmin>;
+  userId: string;
+  cost: number;
+}) {
+  const { admin, userId, cost } = params;
+
+  // 0) tenta garantir linha (se tiver RPC)
+  try {
+    await admin.rpc("ensure_user_credits_row", { p_user_id: userId });
+  } catch {
+    // ignore
+  }
+
+  // 1) RPC preferencial
+  try {
+    const rpc = await admin.rpc("debit_credits", { p_user_id: userId, p_cost: cost });
+    if (!rpc.error) {
+      const newBalance = (rpc.data ?? null) as number | null;
+      if (newBalance === null || Number.isNaN(newBalance)) {
+        throw new Error("RPC debit_credits retornou inválido.");
+      }
+      return { ok: true as const, newBalance };
+    }
+  } catch {
+    // ignore e tenta fallback
+  }
+
+  // 2) fallback (select -> update)
+  const { data: row, error: selErr } = await admin
+    .from("user_credits")
+    .select("balance")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (selErr) throw selErr;
+
+  const balance = Number(row?.balance ?? 0);
+  if (!Number.isFinite(balance) || balance < cost) {
+    return { ok: false as const, balance };
+  }
+
+  const newBalance = balance - cost;
+
+  const { error: updErr } = await admin
+    .from("user_credits")
+    .update({ balance: newBalance })
+    .eq("user_id", userId);
+
+  if (updErr) throw updErr;
+
+  return { ok: true as const, newBalance };
+}
+
+async function refundCreditsBestEffort(params: {
+  admin: ReturnType<typeof createSupabaseAdmin>;
+  userId: string;
+  cost: number;
+}) {
+  const { admin, userId, cost } = params;
+
+  // 1) RPC preferencial
+  try {
+    const rpc = await admin.rpc("refund_credits", { p_user_id: userId, p_cost: cost });
+    if (!rpc.error) return;
+  } catch {
+    // ignore
+  }
+
+  // 2) fallback
+  try {
+    const { data: row } = await admin
+      .from("user_credits")
+      .select("balance")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    const balance = Number(row?.balance ?? 0);
+    const newBalance = (Number.isFinite(balance) ? balance : 0) + cost;
+
+    await admin.from("user_credits").update({ balance: newBalance }).eq("user_id", userId);
+  } catch {
+    // ignore
+  }
+}
+
+async function logUsageBestEffort(params: {
+  admin: ReturnType<typeof createSupabaseAdmin>;
+  userId: string;
+  action: string;
+  creditsUsed: number;
+  meta?: any;
+}) {
+  const { admin, userId, action, creditsUsed, meta } = params;
+  try {
+    await admin.from("usage_logs").insert({
+      user_id: userId,
+      action,
+      credits_used: creditsUsed,
+      meta: meta ?? null,
+    } as any);
+  } catch {
+    // ignore
+  }
+}
+
+/* =========================
    SAFETY / SANITIZAÇÃO
 ========================= */
 function sanitizePrompt(input: string) {
@@ -81,13 +216,18 @@ function noStoreJson(body: any, init?: { status?: number }) {
   });
 }
 
-async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout") {
+/**
+ * ✅ IMPORTANTE:
+ * - Aceita PromiseLike (thenable)
+ * - Promise.resolve(...) converte thenable em Promise real
+ */
+async function withTimeout<T>(p: PromiseLike<T>, ms: number, label = "timeout") {
   let t: NodeJS.Timeout | null = null;
   const timeout = new Promise<never>((_, rej) => {
     t = setTimeout(() => rej(new Error(label)), ms);
   });
   try {
-    return await Promise.race([p, timeout]);
+    return await Promise.race([Promise.resolve(p), timeout]);
   } finally {
     if (t) clearTimeout(t);
   }
@@ -97,6 +237,11 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout") {
    ROUTE
 ========================= */
 export async function POST(req: Request) {
+  // usado para reembolso
+  let charged = false;
+  let chargedUserId: string | null = null;
+  let chargedCost = 0;
+
   try {
     const supabase = await createSupabaseServer();
 
@@ -110,6 +255,27 @@ export async function POST(req: Request) {
 
     const safePrompt = sanitizePrompt(body.prompt);
 
+    // ✅ COBRANÇA ANTES DO OPENAI (monetização)
+    const admin = createSupabaseAdmin();
+    const cost = calcGenerateCost(body.n, body.quality);
+
+    const debit = await debitCreditsAtomic({
+      admin,
+      userId: auth.user.id,
+      cost,
+    });
+
+    if (!debit.ok) {
+      return paymentRequiredJson("Sem créditos para gerar imagens.", {
+        needed: cost,
+        balance: debit.balance ?? 0,
+      });
+    }
+
+    charged = true;
+    chargedUserId = auth.user.id;
+    chargedCost = cost;
+
     const openai = getOpenAI();
 
     // ✅ TIPAGEM: força result como any pra TS não quebrar no build
@@ -121,7 +287,7 @@ export async function POST(req: Request) {
         n: body.n,
         background: body.background,
         quality: mapQuality(body.quality),
-      }) as unknown) as Promise<any>,
+      }) as unknown) as PromiseLike<any>,
       55_000,
       "timeout_generate"
     );
@@ -131,43 +297,85 @@ export async function POST(req: Request) {
       .filter(Boolean) as string[];
 
     if (!images.length) {
+      // ✅ reembolso se nada retornou
+      await refundCreditsBestEffort({ admin, userId: auth.user.id, cost });
+      charged = false;
+      chargedUserId = null;
+      chargedCost = 0;
+
       return noStoreJson({ error: "Nenhuma imagem retornada." }, { status: 500 });
     }
 
     // Upload no Supabase Storage (opcional)
     let uploaded: Array<{ url: string; path: string }> = [];
     try {
-      const admin = createSupabaseAdmin();
       const bucket = "imaginario";
 
-      for (const b64 of images) {
-        const path = `${auth.user.id}/${Date.now()}_${crypto.randomUUID()}.png`;
+      // ✅ timeout curto pra storage não travar
+      await withTimeout(
+        (async () => {
+          for (const b64 of images) {
+            const path = `${auth.user.id}/${Date.now()}_${crypto.randomUUID()}.png`;
 
-        const up = await admin.storage.from(bucket).upload(path, b64ToUint8Array(b64), {
-          contentType: "image/png",
-          upsert: false,
-        });
-        if (up.error) throw up.error;
+            const up = await admin.storage.from(bucket).upload(path, b64ToUint8Array(b64), {
+              contentType: "image/png",
+              upsert: false,
+            });
+            if (up.error) throw up.error;
 
-        const pub = admin.storage.from(bucket).getPublicUrl(path);
-        uploaded.push({ url: pub.data.publicUrl, path });
-      }
+            const pub = admin.storage.from(bucket).getPublicUrl(path);
+            uploaded.push({ url: pub.data.publicUrl, path });
+          }
+        })(),
+        7_000,
+        "timeout_storage"
+      );
     } catch {
       // storage opcional: se falhar, devolve base64
+      uploaded = [];
     }
 
-    // Log no banco (opcional) — evita TS never
+    // Log no banco (opcional)
     try {
-      const admin = createSupabaseAdmin();
-      await admin.from("generations").insert(
-        {
-          user_id: auth.user.id,
-          kind: "generate",
-          prompt: safePrompt,
-          size: body.size,
-          n: body.n,
-          results: uploaded.length ? uploaded : images.map((b64) => ({ b64 })),
-        } as any
+      await withTimeout(
+        Promise.resolve(
+          admin.from("generations").insert(
+            {
+              user_id: auth.user.id,
+              kind: "generate",
+              prompt: safePrompt,
+              size: body.size,
+              n: body.n,
+              results: uploaded.length ? uploaded : images.map((b64) => ({ b64 })),
+            } as any
+          ) as any
+        ),
+        2_000,
+        "timeout_db"
+      );
+    } catch {
+      // ignore
+    }
+
+    // ✅ LOG DE USO (best effort)
+    try {
+      await withTimeout(
+        Promise.resolve(
+          logUsageBestEffort({
+            admin,
+            userId: auth.user.id,
+            action: "generate",
+            creditsUsed: cost,
+            meta: {
+              n: body.n,
+              size: body.size,
+              quality: body.quality,
+              background: body.background,
+            },
+          }) as any
+        ),
+        1_500,
+        "timeout_usage"
       );
     } catch {
       // ignore
@@ -175,11 +383,26 @@ export async function POST(req: Request) {
 
     return noStoreJson({
       ok: true,
+      charged: { credits: cost },
       uploaded: uploaded.length ? uploaded : null,
       images_b64: uploaded.length ? null : images,
       prompt_used: safePrompt,
     });
   } catch (err: any) {
+    // ✅ reembolso best-effort se já cobrou e falhou
+    try {
+      if (charged && chargedUserId && chargedCost > 0) {
+        const admin = createSupabaseAdmin();
+        await refundCreditsBestEffort({
+          admin,
+          userId: chargedUserId,
+          cost: chargedCost,
+        });
+      }
+    } catch {
+      // ignore
+    }
+
     if (err?.name === "ZodError") {
       return noStoreJson(
         { error: "Dados inválidos.", details: err?.issues },
