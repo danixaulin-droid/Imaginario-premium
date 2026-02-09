@@ -28,6 +28,16 @@ import {
 
 type Generated = { url?: string; b64?: string; path?: string };
 
+type HistoryRow = {
+  id: string;
+  created_at: string;
+  kind: "generate" | "edit";
+  prompt: string;
+  size: string;
+  n: number;
+  results: unknown;
+};
+
 /* =========================
    MONETIZAÇÃO (UI)
 ========================= */
@@ -88,6 +98,41 @@ function Toggle({
 
 function dataUrlFromB64(b64: string) {
   return `data:image/png;base64,${b64}`;
+}
+
+/**
+ * ✅ HISTÓRICO: normaliza `results` vindo do Supabase para virar Generated[]
+ * Aceita:
+ * - [{ url, path }] (storage)
+ * - [{ b64 }] (fallback)
+ * - ["...b64..."] (caso antigo)
+ * - null/undefined
+ */
+function normalizeResults(results: unknown): Generated[] {
+  if (!results) return [];
+  if (!Array.isArray(results)) return [];
+
+  const out: Generated[] = [];
+
+  for (const it of results) {
+    // formato: { url, path } ou { b64 }
+    if (it && typeof it === "object") {
+      const obj = it as Record<string, unknown>;
+      const url = typeof obj.url === "string" ? obj.url : undefined;
+      const path = typeof obj.path === "string" ? obj.path : undefined;
+      const b64 = typeof obj.b64 === "string" ? obj.b64 : undefined;
+
+      if (url || b64) out.push({ url, path, b64 });
+      continue;
+    }
+
+    // formato: "b64string"
+    if (typeof it === "string" && it.length > 0) {
+      out.push({ b64: it });
+    }
+  }
+
+  return out;
 }
 
 async function fileFromInput(input: HTMLInputElement): Promise<File | null> {
@@ -531,7 +576,6 @@ function PaywallModal({
             <div className="grid gap-2">
               <Button
                 onClick={() => {
-                  // aqui você pode trocar para sua rota de checkout depois
                   toast.message("Conecte aqui seu checkout (Stripe/Mercado Pago).");
                 }}
               >
@@ -596,7 +640,7 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   >("auto");
 
   const [results, setResults] = useState<Generated[]>([]);
-  const [history, setHistory] = useState<any[]>([]);
+  const [history, setHistory] = useState<HistoryRow[]>([]);
 
   const signedInLabel = useMemo(() => userEmail || "logado", [userEmail]);
 
@@ -645,7 +689,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       .limit(30);
 
     if (error) return;
-    setHistory(data ?? []);
+
+    const rows = (data ?? []) as unknown as HistoryRow[];
+    setHistory(rows);
   }
 
   useEffect(() => {
@@ -1098,27 +1144,95 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
                       Sem histórico ainda.
                     </div>
                   ) : (
-                    history.map((h) => (
-                      <div
-                        key={h.id}
-                        className="rounded-3xl border border-white/10 bg-white/5 p-4"
-                      >
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="text-sm">
-                            <span className="font-semibold">
-                              {h.kind === "edit" ? "Edição" : "Geração"}
-                            </span>{" "}
-                            <span className="text-zinc-400">
-                              • {new Date(h.created_at).toLocaleString()}
-                            </span>
+                    history.map((h) => {
+                      const imgs = normalizeResults(h.results);
+                      const thumbs = imgs.slice(0, 4);
+
+                      return (
+                        <div
+                          key={h.id}
+                          className="rounded-3xl border border-white/10 bg-white/5 p-4"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="text-sm">
+                              <span className="font-semibold">
+                                {h.kind === "edit" ? "Edição" : "Geração"}
+                              </span>{" "}
+                              <span className="text-zinc-400">
+                                • {new Date(h.created_at).toLocaleString()}
+                              </span>
+                            </div>
+                            <div className="text-xs text-zinc-400">
+                              {h.size} • n={h.n}
+                            </div>
                           </div>
-                          <div className="text-xs text-zinc-400">
-                            {h.size} • n={h.n}
+
+                          <div className="mt-2 text-sm text-zinc-200">{h.prompt}</div>
+
+                          {/* ✅ thumbnails */}
+                          {thumbs.length > 0 ? (
+                            <div className="mt-3 grid grid-cols-4 gap-2">
+                              {thumbs.map((it, idx) => {
+                                const src =
+                                  it.url || (it.b64 ? dataUrlFromB64(it.b64) : "");
+                                return (
+                                  <button
+                                    key={`${h.id}_${idx}`}
+                                    type="button"
+                                    className="relative overflow-hidden rounded-2xl border border-white/10 bg-black"
+                                    onClick={() => {
+                                      setResults(imgs);
+                                      toast.message("Carreguei as imagens na prévia.");
+                                    }}
+                                    title="Ver na prévia"
+                                  >
+                                    {src ? (
+                                      <Image
+                                        src={src}
+                                        alt="thumb"
+                                        width={256}
+                                        height={256}
+                                        className="h-20 w-full object-cover"
+                                        unoptimized={!!it.b64}
+                                      />
+                                    ) : (
+                                      <div className="h-20 w-full" />
+                                    )}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <div className="mt-3 text-xs text-zinc-400">
+                              (Sem imagem salva nesta geração)
+                            </div>
+                          )}
+
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <Button
+                              variant="secondary"
+                              onClick={() => {
+                                setResults(imgs);
+                                toast.message("Carreguei as imagens na prévia.");
+                              }}
+                              disabled={imgs.length === 0}
+                            >
+                              <ImagePlus className="h-4 w-4" />
+                              Ver na prévia
+                            </Button>
+
+                            <Button
+                              variant="secondary"
+                              onClick={() => download(imgs[0])}
+                              disabled={imgs.length === 0}
+                            >
+                              <Download className="h-4 w-4" />
+                              Baixar 1ª
+                            </Button>
                           </div>
                         </div>
-                        <div className="mt-2 text-sm text-zinc-200">{h.prompt}</div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
               </Card>
