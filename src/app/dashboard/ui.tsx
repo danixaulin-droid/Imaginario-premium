@@ -21,9 +21,26 @@ import {
   Info,
   Layers,
   RefreshCw,
+  Coins,
+  AlertTriangle,
 } from "lucide-react";
 
 type Generated = { url?: string; b64?: string; path?: string };
+
+/* =========================
+   MONETIZAÇÃO (UI)
+========================= */
+
+// custos iguais aos do backend
+const CREDIT_COST_EDIT = 2;
+const CREDIT_COST_PER_IMAGE = 1;
+const CREDIT_EXTRA_HD_PER_IMAGE = 1;
+
+function calcGenerateCost(n: number, quality: "standard" | "hd") {
+  const base = n * CREDIT_COST_PER_IMAGE;
+  const extra = quality === "hd" ? n * CREDIT_EXTRA_HD_PER_IMAGE : 0;
+  return base + extra;
+}
 
 /* =========================
    UI HELPERS
@@ -278,7 +295,7 @@ async function compressImageFile(
 
     quality = Math.max(minQuality, quality - 0.08);
 
-    // ✅ FIX DO BUILD: era "hn" (não existe). O certo é "nh".
+    // ✅ FIX: era "hn" (não existe). O certo é "nh".
     if (i >= 2) {
       nw = Math.max(1, Math.round(nw * 0.9));
       nh = Math.max(1, Math.round(nh * 0.9));
@@ -450,6 +467,10 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   // ✅ state do assistente de prompt (usado no Generate e no Edit)
   const [promptAssist, setPromptAssist] = useState(true);
 
+  // ✅ MONETIZAÇÃO: saldo (UI)
+  const [credits, setCredits] = useState<number | null>(null);
+  const [creditsLoading, setCreditsLoading] = useState(false);
+
   // generate
   const [prompt, setPrompt] = useState(
     "Retrato realista de uma pessoa adulta (18+), luz suave, fundo desfocado, 35mm, alto detalhe."
@@ -476,6 +497,38 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
 
   const signedInLabel = useMemo(() => userEmail || "logado", [userEmail]);
 
+  // ✅ custo atual na UI
+  const generateCost = useMemo(() => calcGenerateCost(n, quality), [n, quality]);
+  const editCost = CREDIT_COST_EDIT;
+
+  const hasCreditsInfo = credits !== null && Number.isFinite(credits);
+  const canGenerate = !hasCreditsInfo || (credits as number) >= generateCost;
+  const canEdit = !hasCreditsInfo || (credits as number) >= editCost;
+
+  async function loadCredits(showToast = false) {
+    try {
+      setCreditsLoading(true);
+      const { data, error } = await supabase
+        .from("user_credits")
+        .select("balance")
+        .maybeSingle();
+
+      if (error) throw error;
+
+      const bal = Number((data as any)?.balance ?? 0);
+      const safeBal = Number.isFinite(bal) ? bal : 0;
+      setCredits(safeBal);
+
+      if (showToast) toast.success("Saldo atualizado.");
+    } catch {
+      // não trava a UI se falhar
+      setCredits(null);
+      if (showToast) toast.error("Não consegui carregar seus créditos.");
+    } finally {
+      setCreditsLoading(false);
+    }
+  }
+
   async function loadHistory() {
     const { data, error } = await supabase
       .from("generations")
@@ -488,14 +541,26 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
   }
 
   useEffect(() => {
+    // carrega saldo ao entrar
+    loadCredits(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     if (tab === "history") loadHistory();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab]);
 
   async function onGenerate() {
     if (inFlightRef.current) return;
-    inFlightRef.current = true;
 
+    // ✅ trava se sem créditos (quando sabemos o saldo)
+    if (hasCreditsInfo && !canGenerate) {
+      toast.error(`Sem créditos. Precisa de ${generateCost} e você tem ${credits}.`);
+      return;
+    }
+
+    inFlightRef.current = true;
     setLoading(true);
     setResults([]);
 
@@ -531,6 +596,13 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       const { text, json } = await safeReadJson(res);
 
       if (!res.ok) {
+        // ✅ monetização
+        if (res.status === 402) {
+          toast.error(json?.error ?? "Sem créditos para gerar.");
+          await loadCredits(false);
+          return;
+        }
+
         const msg = json?.error ?? text ?? "Falha ao gerar.";
         if (isLikelySafetyBlockedMessage(msg)) {
           throw new Error(
@@ -551,6 +623,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
 
       setResults(out);
       toast.success("Imagem gerada!");
+
+      // ✅ atualiza saldo após uso
+      await loadCredits(false);
     } catch (err: any) {
       if (err?.name === "AbortError") {
         toast.error("Demorou demais e foi cancelado. Tente de novo.");
@@ -565,8 +640,14 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
 
   async function onEdit(imageFile: File, maskFile?: File | null) {
     if (inFlightRef.current) return;
-    inFlightRef.current = true;
 
+    // ✅ trava se sem créditos (quando sabemos o saldo)
+    if (hasCreditsInfo && !canEdit) {
+      toast.error(`Sem créditos. Precisa de ${editCost} e você tem ${credits}.`);
+      return;
+    }
+
+    inFlightRef.current = true;
     setLoading(true);
     setResults([]);
 
@@ -637,6 +718,13 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
       const { text, json } = await safeReadJson(res);
 
       if (!res.ok) {
+        // ✅ monetização
+        if (res.status === 402) {
+          toast.error(json?.error ?? "Sem créditos para editar.");
+          await loadCredits(false);
+          return;
+        }
+
         const msg = json?.error ?? text ?? "Falha ao editar.";
 
         if (isPayloadTooLargeMessage(msg)) {
@@ -657,6 +745,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
 
       setResults(out);
       toast.success("Edição concluída!");
+
+      // ✅ atualiza saldo após uso
+      await loadCredits(false);
     } catch (err: any) {
       if (err?.name === "AbortError") {
         toast.error("Demorou demais e foi cancelado. Use uma imagem menor.");
@@ -685,13 +776,62 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
     <div className="grid gap-6">
       {/* Top bar */}
       <div className="flex flex-wrap items-end justify-between gap-3">
-        <div className="grid gap-1">
+        <div className="grid gap-2">
           <div className="inline-flex w-fit items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
             <ImageIcon className="h-4 w-4" />
             Studio • {panelTitle}
             <ChevronRight className="h-4 w-4 opacity-60" />
             <span className="text-zinc-300">{signedInLabel}</span>
           </div>
+
+          {/* ✅ Créditos */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
+              <Coins className="h-4 w-4 text-yellow-200" />
+              {creditsLoading ? (
+                <span className="text-zinc-300">Carregando créditos...</span>
+              ) : credits === null ? (
+                <span className="text-zinc-300">Créditos: —</span>
+              ) : (
+                <span className="text-zinc-200">
+                  Créditos: <b className="text-white">{credits}</b>
+                </span>
+              )}
+            </div>
+
+            <Button
+              variant="secondary"
+              onClick={() => loadCredits(true)}
+              disabled={creditsLoading}
+            >
+              <RefreshCw className="h-4 w-4" />
+              Atualizar saldo
+            </Button>
+
+            {/* custo estimado */}
+            <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
+              <Info className="h-4 w-4" />
+              {tab === "generate" ? (
+                <span>
+                  Custo agora: <b>{generateCost}</b>
+                </span>
+              ) : tab === "edit" ? (
+                <span>
+                  Custo agora: <b>{editCost}</b>
+                </span>
+              ) : (
+                <span>Custos variam por ação</span>
+              )}
+            </div>
+
+            {hasCreditsInfo && ((tab === "generate" && !canGenerate) || (tab === "edit" && !canEdit)) ? (
+              <div className="inline-flex items-center gap-2 rounded-full border border-red-500/20 bg-red-500/10 px-3 py-1 text-xs text-red-200">
+                <AlertTriangle className="h-4 w-4" />
+                Saldo insuficiente
+              </div>
+            ) : null}
+          </div>
+
           <h1 className="text-2xl font-semibold">Dashboard</h1>
           <p className="text-sm text-zinc-300">
             Gere e edite com estabilidade (mobile + Vercel).
@@ -792,9 +932,13 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
                   </label>
                 </div>
 
-                <Button onClick={onGenerate} disabled={loading}>
+                <Button onClick={onGenerate} disabled={loading || (hasCreditsInfo && !canGenerate)}>
                   <Sparkles className="h-4 w-4" />
-                  {loading ? "Gerando..." : "Gerar imagem"}
+                  {hasCreditsInfo && !canGenerate
+                    ? `Sem créditos (precisa ${generateCost})`
+                    : loading
+                    ? "Gerando..."
+                    : `Gerar imagem (${generateCost} crédito${generateCost === 1 ? "" : "s"})`}
                 </Button>
 
                 <div className="flex items-start gap-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
@@ -822,6 +966,9 @@ export default function DashboardClient({ userEmail }: { userEmail: string }) {
               onEdit={onEdit}
               promptAssist={promptAssist}
               setPromptAssist={setPromptAssist}
+              // ✅ monetização
+              editCost={editCost}
+              canEdit={!(hasCreditsInfo && !canEdit)}
             />
           )}
 
@@ -971,6 +1118,10 @@ function EditPanelPremium(props: {
   onEdit: (imageFile: File, maskFile?: File | null) => Promise<void>;
   promptAssist: boolean;
   setPromptAssist: (v: boolean) => void;
+
+  // ✅ monetização
+  editCost: number;
+  canEdit: boolean;
 }) {
   const [imageElId] = useState(() => `img_${Math.random().toString(16).slice(2)}`);
   const [maskElId] = useState(() => `msk_${Math.random().toString(16).slice(2)}`);
@@ -1023,9 +1174,13 @@ function EditPanelPremium(props: {
         <div className="grid grid-cols-2 gap-3">
           <label className="grid gap-1 text-sm">
             <span className="text-zinc-300">Tamanho</span>
-            <Select value={props.editSize} onChange={(e) => props.setEditSize(e.target.value)} disabled>
+            <Select
+              value={props.editSize}
+              onChange={(e) => props.setEditSize(e.target.value)}
+              disabled
+            >
               <option value="1024x1024">1024×1024 (fixo)</option>
-              <option value="1024x1536">1024×1536</option>
+              <option value="1024x1536">1024×1026</option>
               <option value="1536x1024">1536×1024</option>
             </Select>
             <p className="text-xs text-zinc-500">Fixado para evitar travamentos.</p>
@@ -1073,9 +1228,13 @@ function EditPanelPremium(props: {
           </div>
         </div>
 
-        <Button onClick={onPickAndSend} disabled={props.loading}>
+        <Button onClick={onPickAndSend} disabled={props.loading || !props.canEdit}>
           <Upload className="h-4 w-4" />
-          {props.loading ? "Editando..." : "Enviar e editar"}
+          {!props.canEdit
+            ? `Sem créditos (precisa ${props.editCost})`
+            : props.loading
+            ? "Editando..."
+            : `Enviar e editar (${props.editCost} créditos)`}
         </Button>
 
         <div className="flex items-start gap-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
