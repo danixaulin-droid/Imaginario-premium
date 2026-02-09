@@ -31,16 +31,15 @@ async function debitCreditsAtomic(params: {
   const { admin, userId, cost } = params;
 
   // 1) tenta RPC (se existir no seu SQL)
+  // ✅ FIX: cast para any evita erro de tipagem quando Database não declara a RPC
   try {
-    const rpc = await admin.rpc("debit_credits", {
+    const rpc = await (admin as any).rpc("debit_credits", {
       p_user_id: userId,
       p_cost: cost,
     });
-    if (!rpc.error) {
-      const newBalance = (rpc.data ?? null) as number | null;
-      if (newBalance === null || Number.isNaN(newBalance)) {
-        throw new Error("RPC inválido");
-      }
+    if (!rpc?.error) {
+      const newBalance = (rpc?.data ?? null) as number | null;
+      if (newBalance === null || Number.isNaN(newBalance)) throw new Error("RPC inválido");
       return { ok: true as const, newBalance };
     }
   } catch {
@@ -81,12 +80,13 @@ async function refundCreditsBestEffort(params: {
   const { admin, userId, cost } = params;
 
   // tenta RPC
+  // ✅ FIX: cast para any evita erro de tipagem quando Database não declara a RPC
   try {
-    const rpc = await admin.rpc("refund_credits", {
+    const rpc = await (admin as any).rpc("refund_credits", {
       p_user_id: userId,
       p_cost: cost,
     });
-    if (!rpc.error) return;
+    if (!rpc?.error) return;
   } catch {
     // ignore
   }
@@ -124,9 +124,7 @@ const FieldsSchema = z.object({
   prompt: z.string().min(3).max(2000),
   size: z.enum(["1024x1024", "1024x1536", "1536x1024"]).default("1024x1024"),
   background: z.enum(["auto", "transparent", "opaque"]).default("auto"),
-  quality: z
-    .enum(["standard", "hd", "auto", "low", "medium", "high"])
-    .default("standard"),
+  quality: z.enum(["standard", "hd", "auto", "low", "medium", "high"]).default("standard"),
 });
 
 // endpoint de edit aceita: auto | low | medium | high
@@ -226,7 +224,6 @@ export async function POST(req: Request) {
       return noStoreJson({ error: "Não autenticado." }, { status: 401 });
     }
 
-    // ✅ FIX: removeu "_toggle" que quebrava build
     const contentLength = Number(req.headers.get("content-length") || 0);
     if (contentLength && contentLength > 8 * 1024 * 1024) {
       return noStoreJson(
@@ -273,7 +270,7 @@ export async function POST(req: Request) {
     if (!debit.ok) {
       return paymentRequiredJson("Sem créditos para editar imagens.", {
         needed: cost,
-        balance: debit.balance ?? 0,
+        balance: (debit as any).balance ?? 0,
       });
     }
 
