@@ -47,7 +47,8 @@ async function debitCreditsAtomic(params: {
   }
 
   // 2) fallback: select -> update
-  const { data: row, error: selErr } = await admin
+  // ✅ FIX: cast para any evita "never" quando tabela não está no tipo Database
+  const { data: row, error: selErr } = await (admin as any)
     .from("user_credits")
     .select("balance")
     .eq("user_id", userId)
@@ -55,14 +56,14 @@ async function debitCreditsAtomic(params: {
 
   if (selErr) throw selErr;
 
-  const balance = Number((row as any)?.balance ?? 0);
+  const balance = Number(row?.balance ?? 0);
   if (!Number.isFinite(balance) || balance < cost) {
     return { ok: false as const, balance: Number.isFinite(balance) ? balance : 0 };
   }
 
   const newBalance = balance - cost;
 
-  const { error: updErr } = await admin
+  const { error: updErr } = await (admin as any)
     .from("user_credits")
     .update({ balance: newBalance })
     .eq("user_id", userId);
@@ -93,16 +94,16 @@ async function refundCreditsBestEffort(params: {
 
   // fallback
   try {
-    const { data: row } = await admin
+    const { data: row } = await (admin as any)
       .from("user_credits")
       .select("balance")
       .eq("user_id", userId)
       .maybeSingle();
 
-    const balance = Number((row as any)?.balance ?? 0);
+    const balance = Number(row?.balance ?? 0);
     const newBalance = (Number.isFinite(balance) ? balance : 0) + cost;
 
-    await admin.from("user_credits").update({ balance: newBalance }).eq("user_id", userId);
+    await (admin as any).from("user_credits").update({ balance: newBalance }).eq("user_id", userId);
   } catch {
     // ignore
   }
